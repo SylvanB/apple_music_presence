@@ -3,8 +3,8 @@ mod player;
 mod presence;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::sleep;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, sleep};
 use std::time::Duration;
 
 use discord_presence::Client;
@@ -38,7 +38,89 @@ const FAILURE_LOG_EVERY: u32 = 60;
 /// so this is far inside the budget.
 const REASSERT_INTERVAL_SECS: u64 = 30;
 
-/// What we last pushed to Discord, so we only speak to it when something
+/// What the poll loop wants Discord to be showing.
+#[derive(Debug, Clone)]
+enum Desired {
+    Clear,
+    Show {
+        track: Track,
+        stamps: Option<(u64, u64)>,
+    },
+}
+
+/// A one-slot, latest-wins handoff to the Discord thread.
+///
+/// Discord I/O must not happen on the poll loop. `set_activity` checks the
+/// library's `READY` global — still true after a disconnect — then queues the
+/// message and waits on an *unbounded* channel recv with no timeout. Quitting
+/// Discord mid-update would freeze polling indefinitely, and launchd's
+/// `KeepAlive` would not notice, because the process is alive, merely stuck.
+///
+/// Updates are whole snapshots rather than increments, so when the writer is
+/// blocked the right move is to overwrite the pending one rather than queue
+/// behind it: whatever is playing *now* is the only state worth sending.
+#[derive(Default)]
+struct Mailbox {
+    slot: Mutex<Option<Desired>>,
+    arrived: Condvar,
+}
+
+impl Mailbox {
+    /// Never blocks, never grows.
+    fn put(&self, desired: Desired) {
+        *self.lock() = Some(desired);
+        self.arrived.notify_one();
+    }
+
+    /// Blocks until there is something to send.
+    fn take(&self) -> Desired {
+        let mut slot = self.lock();
+        loop {
+            if let Some(desired) = slot.take() {
+                return desired;
+            }
+            slot = self
+                .arrived
+                .wait(slot)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// A panicking peer leaves the slot intact, and a stale presence beats
+    /// taking the daemon down.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Desired>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Owns everything that can block: the Discord client and the artwork lookups.
+fn run_discord(mut drpc: Client, mailbox: &Mailbox) {
+    let mut artwork = ArtworkClient::new();
+
+    loop {
+        match mailbox.take() {
+            Desired::Clear => {
+                if let Err(err) = drpc.clear_activity() {
+                    warn!("failed to clear presence: {err}");
+                }
+            }
+            Desired::Show { track, stamps } => {
+                let art = artwork.lookup(&track);
+                if let Err(err) = drpc.set_activity(|activity| {
+                    presence::build_activity(activity, &track, art.as_ref(), stamps)
+                }) {
+                    // The poll loop re-asserts on a timer, so a failed send is
+                    // retried without needing to be tracked here.
+                    warn!("failed to set presence: {err}");
+                }
+            }
+        }
+    }
+}
+
+/// What we last asked Discord to show, so we only speak to it when something
 /// actually changed. Discord rate-limits presence updates, and steady playback
 /// should produce no traffic at all.
 struct Shown {
@@ -107,7 +189,12 @@ fn main() {
         return;
     }
 
-    let mut artwork = ArtworkClient::new();
+    let mailbox = Arc::new(Mailbox::default());
+    thread::spawn({
+        let mailbox = Arc::clone(&mailbox);
+        move || run_discord(drpc, &mailbox)
+    });
+
     let mut shown: Option<Shown> = None;
     let mut poll_interval = ACTIVE_POLL_INTERVAL;
     let mut consecutive_failures: u32 = 0;
@@ -151,13 +238,9 @@ fn main() {
 
         if !track.player_state.has_track() {
             if shown.is_some() {
-                match drpc.clear_activity() {
-                    Ok(_) => {
-                        info!("nothing playing, presence cleared");
-                        shown = None;
-                    }
-                    Err(err) => warn!("failed to clear presence: {err}"),
-                }
+                info!("nothing playing, clearing presence");
+                mailbox.put(Desired::Clear);
+                shown = None;
             }
             continue;
         }
@@ -176,7 +259,6 @@ fn main() {
             continue;
         }
 
-        let art = artwork.lookup(&track);
         if changed {
             info!(
                 "{:?}: {} - {}",
@@ -188,13 +270,10 @@ fn main() {
             debug!("re-asserting presence");
         }
 
-        if let Err(err) = drpc.set_activity(|activity| {
-            presence::build_activity(activity, &track, art.as_ref(), stamps)
-        }) {
-            // Leave `shown` untouched so the next poll retries this update.
-            warn!("failed to set presence: {err}");
-            continue;
-        }
+        mailbox.put(Desired::Show {
+            track: track.clone(),
+            stamps,
+        });
 
         shown = Some(Shown {
             state: track.player_state,
@@ -228,6 +307,75 @@ mod tests {
             start,
             sent_at: 0,
         }
+    }
+
+    fn shown_track(desired: &Desired) -> String {
+        match desired {
+            Desired::Show { track, .. } => track.name.clone(),
+            Desired::Clear => "<clear>".into(),
+        }
+    }
+
+    #[test]
+    fn mailbox_keeps_only_the_latest_update() {
+        let mailbox = Mailbox::default();
+
+        for name in ["first", "second", "third"] {
+            mailbox.put(Desired::Show {
+                track: Track {
+                    name: name.into(),
+                    ..playing()
+                },
+                stamps: None,
+            });
+        }
+
+        // A blocked Discord thread must not replay a backlog of stale tracks.
+        assert_eq!(shown_track(&mailbox.take()), "third");
+    }
+
+    #[test]
+    fn mailbox_put_never_blocks_without_a_reader() {
+        let mailbox = Mailbox::default();
+
+        // The whole point: the poll loop keeps running even with nobody taking.
+        for _ in 0..1_000 {
+            mailbox.put(Desired::Clear);
+        }
+
+        assert!(matches!(mailbox.take(), Desired::Clear));
+    }
+
+    #[test]
+    fn mailbox_take_waits_for_an_update() {
+        let mailbox = Arc::new(Mailbox::default());
+        let writer = Arc::clone(&mailbox);
+
+        let handle = thread::spawn(move || {
+            sleep(Duration::from_millis(50));
+            writer.put(Desired::Show {
+                track: playing(),
+                stamps: None,
+            });
+        });
+
+        assert_eq!(shown_track(&mailbox.take()), "The Boxer");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_clear_supersedes_a_pending_show() {
+        let mailbox = Mailbox::default();
+
+        mailbox.put(Desired::Show {
+            track: playing(),
+            stamps: None,
+        });
+        mailbox.put(Desired::Clear);
+
+        // Stopping playback while the writer is stuck must not resurrect the
+        // track once it unblocks.
+        assert!(matches!(mailbox.take(), Desired::Clear));
     }
 
     #[test]
