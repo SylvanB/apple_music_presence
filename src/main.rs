@@ -2,6 +2,8 @@ mod artwork;
 mod player;
 mod presence;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -21,8 +23,9 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How far the computed start anchor may drift before we call it a seek rather
 /// than ordinary rounding between two polls.
 const SEEK_TOLERANCE_SECS: u64 = 2;
-/// How often an unchanged presence is pushed again. Discord allows 5 activity
-/// updates per 20 seconds, so this is far inside the budget.
+/// How often an unchanged presence is pushed again, as a backstop to the
+/// `Connected` event below. Discord allows 5 activity updates per 20 seconds,
+/// so this is far inside the budget.
 const REASSERT_INTERVAL_SECS: u64 = 30;
 
 /// What we last pushed to Discord, so we only speak to it when something
@@ -56,10 +59,10 @@ fn presence_changed(shown: Option<&Shown>, track: &Track, start: Option<u64>) ->
 
 /// Whether the presence is due to be pushed again even though nothing changed.
 ///
-/// `discord-presence` never tells us about a reconnect: `READY` is a global
-/// that is set once and the `Ready` event is suppressed on the second connect,
-/// so quitting and reopening Discord silently drops our activity. Without a
-/// timer the presence would stay blank until the next track change.
+/// A reconnect drops whatever activity we had set, and `Ready` does not fire a
+/// second time — `READY` is a global that is only ever set once. `Connected`
+/// does fire on every connect, and drives the immediate re-assert; this timer
+/// is the backstop for anything that clears the activity without telling us.
 fn reassert_due(shown: Option<&Shown>, now: u64) -> bool {
     shown.is_none_or(|shown| now.saturating_sub(shown.sent_at) >= REASSERT_INTERVAL_SECS)
 }
@@ -71,9 +74,20 @@ fn main() {
 
     let mut drpc = Client::new(APPLE_MUSIC_CLIENT_ID);
 
+    // Set on every connect, including reconnects, and consumed by the loop to
+    // re-push the activity that Discord dropped while we were disconnected.
+    let reconnected = Arc::new(AtomicBool::new(false));
+
     drpc.on_ready(|_ctx| info!("connected to Discord"))
         .persist();
     drpc.on_error(|ctx| error!("discord error: {:?}", ctx.event))
+        .persist();
+    drpc.on_connected({
+        let reconnected = Arc::clone(&reconnected);
+        move |_ctx| reconnected.store(true, Ordering::Relaxed)
+    })
+    .persist();
+    drpc.on_disconnected(|_ctx| warn!("disconnected from Discord"))
         .persist();
 
     drpc.start();
@@ -124,7 +138,8 @@ fn main() {
         let start = stamps.map(|(start, _)| start);
 
         let changed = presence_changed(shown.as_ref(), &track, start);
-        if !changed && !reassert_due(shown.as_ref(), now) {
+        let reconnected = reconnected.swap(false, Ordering::Relaxed);
+        if !changed && !reconnected && !reassert_due(shown.as_ref(), now) {
             continue;
         }
 
@@ -134,6 +149,8 @@ fn main() {
                 "{:?}: {} - {}",
                 track.player_state, track.artist, track.name
             );
+        } else if reconnected {
+            info!("reconnected, restoring presence");
         } else {
             debug!("re-asserting presence");
         }

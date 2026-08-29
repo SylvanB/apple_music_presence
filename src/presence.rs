@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use discord_presence::models::Activity;
+use discord_presence::models::{Activity, ActivityType, DisplayType};
 
 use crate::artwork::Artwork;
 use crate::player::Track;
@@ -55,7 +55,14 @@ pub fn build_activity(
     artwork: Option<&Artwork>,
     timestamps: Option<(u64, u64)>,
 ) -> Activity {
-    let mut activity = activity;
+    // `Listening` is what turns the card from "Playing Apple Music" with a bare
+    // countdown into a music player: Discord renders a seek bar for a Listening
+    // activity that carries both a start and an end stamp. `DisplayType::Details`
+    // then puts the track title in the member-list line, so it reads "Listening
+    // to Hotel Breakfast" rather than "Listening to Apple Music".
+    let mut activity = activity
+        .activity_type(ActivityType::Listening)
+        .status_display(DisplayType::Details);
 
     // Discord's convention: `details` is the headline, `state` the line under it.
     if let Some(details) = field(&track.name) {
@@ -111,6 +118,47 @@ mod tests {
             image_url: "https://example.invalid/512x512bb.jpg".into(),
             track_url: Some("https://music.apple.com/us/album/the-boxer/1".into()),
         }
+    }
+
+    #[test]
+    fn serialises_the_wire_fields_discord_needs_for_a_music_card() {
+        let art = artwork();
+        let stamps = timestamps(&boxer(), 1_000);
+        let activity = build_activity(Activity::new(), &boxer(), Some(&art), stamps);
+        let json = serde_json::to_value(&activity).expect("serialise");
+
+        // type 2 = Listening, status_display_type 2 = show `details`.
+        assert_eq!(json["type"], 2);
+        assert_eq!(json["status_display_type"], 2);
+        assert_eq!(json["details"], "The Boxer");
+        assert_eq!(json["state"], "Simon & Garfunkel");
+        assert_eq!(json["timestamps"]["start"], 959);
+        assert_eq!(json["timestamps"]["end"], 1_271);
+    }
+
+    #[test]
+    fn presents_as_listening_not_playing() {
+        let activity = build_activity(Activity::new(), &boxer(), None, None);
+
+        assert!(matches!(
+            activity.activity_type,
+            Some(ActivityType::Listening)
+        ));
+        assert!(matches!(
+            activity.status_display,
+            Some(DisplayType::Details)
+        ));
+    }
+
+    #[test]
+    fn a_listening_activity_carries_both_stamps_so_discord_draws_a_bar() {
+        let stamps = timestamps(&boxer(), 1_000);
+        let activity = build_activity(Activity::new(), &boxer(), None, stamps);
+        let ts = activity.timestamps.expect("timestamps");
+
+        // Discord only renders the seek bar when both ends are present.
+        assert!(ts.start.is_some());
+        assert!(ts.end.is_some());
     }
 
     #[test]

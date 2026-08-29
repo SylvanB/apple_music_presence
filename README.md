@@ -1,7 +1,9 @@
 # Apple Music Presence for Discord
 
 Reports whatever Apple Music is playing on macOS to Discord via the RPC
-protocol, with album art, a progress bar, and a link back to the track.
+protocol. Presents as a **Listening** activity, so Discord renders it as a music
+card — album art, a seek bar, and a link back to the track — rather than as a
+game with a countdown.
 
 ## Usage
 
@@ -42,10 +44,24 @@ rm ~/Library/LaunchAgents/com.goldsoultheory.apple-music-presence.plist
   pausing and restarting the daemon.
 - Discord is only sent an update when something really changed; steady playback
   produces no traffic beyond a re-assert every 30 seconds.
-- The re-assert is what survives a Discord restart. `discord-presence` exposes
-  no reconnect signal — `READY` is a global set once, and the `Ready` event is
-  suppressed on the second connect — so a restart silently drops the activity
-  and only a timer brings it back.
+- A Discord restart is recovered from immediately. Reconnecting drops whatever
+  activity was set and `Ready` does not fire twice (`READY` is a global set
+  once), so the `Connected` event drives the re-push; the 30 second timer is
+  only a backstop.
+
+## Why it looks like a music player
+
+Three things have to line up, and Discord silently falls back to the game-style
+card if any is missing:
+
+| Field | Value | Effect |
+| --- | --- | --- |
+| `type` | `2` (Listening) | "Listening to" instead of "Playing" |
+| `timestamps` | **both** `start` and `end` | seek bar instead of a countdown |
+| `status_display_type` | `2` (Details) | member list shows the track, not the app |
+
+`details` carries the track and `state` the artist, which is the order Discord
+expects; the album goes to `large_text` as the artwork tooltip.
 
 ## Album art
 
