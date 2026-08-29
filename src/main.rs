@@ -2,6 +2,7 @@ mod artwork;
 mod player;
 mod presence;
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
@@ -27,6 +28,10 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How far the computed start anchor may drift before we call it a seek rather
 /// than ordinary rounding between two polls.
 const SEEK_TOLERANCE_SECS: u64 = 2;
+/// Days of logs kept when running as a service. Steady state is one line per
+/// track change, so this is kilobytes, but launchd appends forever and would
+/// otherwise never expire any of it.
+const LOG_FILES_KEPT: usize = 7;
 /// How often the Discord thread re-checks whether it may send.
 const SEND_RECHECK: Duration = Duration::from_millis(500);
 /// How long a single Discord update may be outstanding before we treat the
@@ -191,10 +196,45 @@ fn reassert_due(shown: Option<&Shown>, now: u64) -> bool {
     shown.is_none_or(|shown| now.saturating_sub(shown.sent_at) >= REASSERT_INTERVAL_SECS)
 }
 
+/// Logs to the terminal when there is one, and to a rotating file when there
+/// is not — which is how it runs under launchd. Returns the appender guard,
+/// which must outlive logging.
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let builder = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO);
+
+    if std::io::stdout().is_terminal() {
+        builder.init();
+        return None;
+    }
+
+    let Some(home) = std::env::var_os("HOME") else {
+        builder.init();
+        return None;
+    };
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("apple-music-presence")
+        .filename_suffix("log")
+        .max_log_files(LOG_FILES_KEPT)
+        .build(std::path::Path::new(&home).join("Library/Logs"));
+
+    match appender {
+        Ok(appender) => {
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            builder.with_ansi(false).with_writer(writer).init();
+            Some(guard)
+        }
+        Err(err) => {
+            builder.init();
+            warn!("falling back to stdout logging: {err}");
+            None
+        }
+    }
+}
+
 fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // Held for the life of the process so buffered lines are always flushed.
+    let _log_guard = init_logging();
 
     let mut drpc = Client::new(APPLE_MUSIC_CLIENT_ID);
 

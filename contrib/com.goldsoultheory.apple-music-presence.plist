@@ -23,8 +23,10 @@
     <key>ProcessType</key>
     <string>Background</string>
 
-    <key>StandardOutPath</key>
-    <string>__LOG__</string>
+    <!-- The program writes its own rotating log into ~/Library/Logs. Only
+         stderr is redirected here, to catch panics, which never reach the
+         logging layer. Redirecting stdout as well would append an unrotated
+         duplicate of everything. -->
     <key>StandardErrorPath</key>
     <string>__LOG__</string>
 </dict>

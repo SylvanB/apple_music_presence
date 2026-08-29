@@ -10,7 +10,7 @@ LABEL="com.goldsoultheory.apple-music-presence"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="$REPO/target/release/apple_music_presence"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG="$HOME/Library/Logs/apple-music-presence.log"
+LOG="$HOME/Library/Logs/apple-music-presence.panic.log"
 
 echo "==> Building release binary"
 cargo build --release --manifest-path "$REPO/Cargo.toml"
@@ -25,6 +25,8 @@ echo "==> Loading agent"
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$PLIST"
 
-echo "==> Installed. Logs: $LOG"
+echo "==> Installed."
+echo "    Logs:   $HOME/Library/Logs/apple-music-presence.<date>.log (rotated daily, 7 kept)"
+echo "    Panics: $LOG"
 echo "    Stop with:      launchctl bootout gui/$UID/$LABEL"
 echo "    Uninstall with: launchctl bootout gui/$UID/$LABEL && rm $PLIST"

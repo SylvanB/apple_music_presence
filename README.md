@@ -25,7 +25,16 @@ Do the manual run first. macOS shows the Automation permission dialog to the
 foreground process that triggers it, and a launchd agent has no way to put that
 dialog in front of you — installed first, it would simply fail to read Music.
 
-Logs land in `~/Library/Logs/apple-music-presence.log`. To remove it:
+Logs land in `~/Library/Logs/apple-music-presence.<date>.log`, rotated daily
+with a week kept. Run from a terminal it logs to the console instead, so an
+interactive run never writes a file. `apple-music-presence.panic.log` catches
+anything that dies before reaching the logging layer, and is normally empty.
+
+Steady state is one line per track change, around 100 lines a day of heavy
+listening — the rotation is there because launchd would otherwise append to a
+single file forever, not because the volume is large.
+
+To remove the agent:
 
 ```bash
 launchctl bootout gui/$UID/com.goldsoultheory.apple-music-presence
