@@ -40,6 +40,21 @@ struct SearchResult {
     collection_name: Option<String>,
     #[serde(default, rename = "trackViewUrl")]
     track_view_url: Option<String>,
+    /// Album searches carry no track URL, only a collection one.
+    #[serde(default, rename = "collectionViewUrl")]
+    collection_view_url: Option<String>,
+}
+
+impl SearchResult {
+    fn to_artwork(&self) -> Option<Artwork> {
+        Some(Artwork {
+            image_url: upscale(self.artwork_url_100.as_deref()?),
+            track_url: self
+                .track_view_url
+                .clone()
+                .or_else(|| self.collection_view_url.clone()),
+        })
+    }
 }
 
 /// iTunes serves 100px thumbnails by default; the same path happily serves
@@ -48,17 +63,31 @@ fn upscale(artwork_url: &str) -> String {
     artwork_url.replace("100x100bb", "512x512bb")
 }
 
+/// iTunes labels short releases "Album - Single" / "Album - EP" where Music.app
+/// reports the bare title, so both sides are stripped before comparison.
+fn normalise_album(album: &str) -> String {
+    let album = album.trim();
+    let album = album
+        .strip_suffix(" - Single")
+        .or_else(|| album.strip_suffix(" - EP"))
+        .unwrap_or(album);
+
+    album.to_lowercase()
+}
+
 /// Picks the result whose album matches the one actually playing, since a
 /// search for "artist track" routinely returns the single, a live cut and
 /// three compilations before the album the listener is on.
 fn pick_best<'a>(results: &'a [SearchResult], album: &str) -> Option<&'a SearchResult> {
+    let wanted = normalise_album(album);
+
     results
         .iter()
         .find(|result| {
             result
                 .collection_name
                 .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(album))
+                .is_some_and(|name| normalise_album(name) == wanted)
         })
         .or_else(|| results.first())
 }
@@ -113,27 +142,38 @@ impl ArtworkClient {
     }
 
     fn search(&self, track: &Track) -> Result<Option<Artwork>, reqwest::Error> {
-        let term = format!("{} {}", track.artist, track.name);
+        if !track.name.is_empty() {
+            let term = format!("{} {}", track.artist, track.name);
+            if let Some(artwork) = self.search_entity(&term, "song", &track.album)? {
+                return Ok(Some(artwork));
+            }
+        }
+
+        // Local files, non-English titles and remixes routinely miss the song
+        // index but still match at the album level, which is all the art needs.
+        if track.album.is_empty() {
+            return Ok(None);
+        }
+
+        let term = format!("{} {}", track.artist, track.album);
+        self.search_entity(&term, "album", &track.album)
+    }
+
+    fn search_entity(
+        &self,
+        term: &str,
+        entity: &str,
+        album: &str,
+    ) -> Result<Option<Artwork>, reqwest::Error> {
         let response = self
             .http
             .get(SEARCH_ENDPOINT)
-            .query(&[
-                ("term", term.as_str()),
-                ("entity", "song"),
-                ("limit", SEARCH_LIMIT),
-            ])
+            .query(&[("term", term), ("entity", entity), ("limit", SEARCH_LIMIT)])
             .send()?
             .error_for_status()?
             .json::<SearchResponse>()?;
 
-        Ok(
-            pick_best(&response.results, &track.album).and_then(|result| {
-                result.artwork_url_100.as_deref().map(|url| Artwork {
-                    image_url: upscale(url),
-                    track_url: result.track_view_url.clone(),
-                })
-            }),
-        )
+        Ok(pick_best(&response.results, album).and_then(SearchResult::to_artwork))
     }
 }
 
@@ -149,6 +189,50 @@ mod tests {
 
     fn fixture() -> SearchResponse {
         serde_json::from_str(include_str!("../tests/fixtures/itunes_search.json")).unwrap()
+    }
+
+    fn album_fixture() -> SearchResponse {
+        serde_json::from_str(include_str!("../tests/fixtures/itunes_album_search.json")).unwrap()
+    }
+
+    /// Hits the live iTunes API, so it is not part of the default run:
+    /// `cargo test -- --ignored`. Worth having, since the one thing unit tests
+    /// cannot catch is Apple changing the response shape underneath us.
+    #[test]
+    #[ignore]
+    fn live_lookup_finds_art_by_song_and_by_album() {
+        let mut client = ArtworkClient::new();
+
+        let known = Track {
+            artist: "Simon & Garfunkel".into(),
+            name: "The Boxer".into(),
+            album: "Bridge Over Troubled Water".into(),
+            ..Track::default()
+        };
+        let art = client.lookup(&known).expect("song search should find art");
+        assert!(art.image_url.contains("512x512bb"));
+        assert!(art.track_url.is_some());
+
+        // No such song, but the album is real: only the fallback can serve this.
+        let album_only = Track {
+            artist: "Simon & Garfunkel".into(),
+            name: String::new(),
+            album: "Bridge Over Troubled Water".into(),
+            ..Track::default()
+        };
+        let art = client
+            .lookup(&album_only)
+            .expect("album search should find art");
+        assert!(art.image_url.contains("512x512bb"));
+
+        // Nonsense must degrade to no art rather than panicking.
+        let nonsense = Track {
+            artist: "zzqqxx".into(),
+            name: "zzqqxx".into(),
+            album: "zzqqxx".into(),
+            ..Track::default()
+        };
+        assert!(client.lookup(&nonsense).is_none());
     }
 
     #[test]
@@ -200,6 +284,60 @@ mod tests {
             picked.collection_name.as_deref(),
             Some("Bridge Over Troubled Water")
         );
+    }
+
+    #[test]
+    fn matches_across_itunes_single_and_ep_suffixes() {
+        // Music.app reports "I Don't Wanna Change"; iTunes calls the same
+        // release "I Don't Wanna Change - Single".
+        let response = album_fixture();
+        let picked = pick_best(&response.results, "I Don't Wanna Change").unwrap();
+
+        assert_eq!(
+            picked.collection_name.as_deref(),
+            Some("I Don't Wanna Change - Single")
+        );
+        assert_eq!(normalise_album("Abbey Road - EP"), "abbey road");
+    }
+
+    #[test]
+    fn album_results_fall_back_to_the_collection_link() {
+        let response = album_fixture();
+        let artwork = pick_best(&response.results, "I Don't Wanna Change")
+            .and_then(SearchResult::to_artwork)
+            .expect("artwork");
+
+        assert!(artwork.image_url.contains("512x512bb"));
+        // Album hits carry no trackViewUrl, so the collection URL stands in.
+        assert!(artwork
+            .track_url
+            .as_deref()
+            .is_some_and(|url| url.contains("/album/i-dont-wanna-change-single/")));
+    }
+
+    #[test]
+    fn a_result_without_art_yields_nothing() {
+        let bare = SearchResult {
+            artwork_url_100: None,
+            collection_name: Some("Whatever".into()),
+            track_view_url: Some("https://music.apple.com/x".into()),
+            collection_view_url: None,
+        };
+
+        assert!(bare.to_artwork().is_none());
+    }
+
+    #[test]
+    fn song_hits_prefer_the_track_link_over_the_collection_link() {
+        let response = fixture();
+        let artwork = pick_best(&response.results, "Bridge Over Troubled Water")
+            .and_then(SearchResult::to_artwork)
+            .expect("artwork");
+
+        assert!(artwork
+            .track_url
+            .as_deref()
+            .is_some_and(|url| url.contains("?i=")));
     }
 
     #[test]

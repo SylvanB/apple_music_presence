@@ -1,0 +1,11 @@
+
+
+
+{
+ "resultCount":2,
+ "results": [
+{"wrapperType":"collection", "collectionType":"Album", "artistId":1489401575, "collectionId":1494113219, "artistName":"Senses", "collectionName":"I Don't Wanna Change - Single", "collectionCensoredName":"I Don't Wanna Change - Single", "artistViewUrl":"https://music.apple.com/us/artist/senses/1489401575?uo=4", "collectionViewUrl":"https://music.apple.com/us/album/i-dont-wanna-change-single/1494113219?uo=4", "artworkUrl60":"https://is1-ssl.mzstatic.com/image/thumb/Music123/v4/0d/2c/c4/0d2cc44c-bc89-4271-759d-3a0f950b601a/artwork.jpg/60x60bb.jpg", "artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/Music123/v4/0d/2c/c4/0d2cc44c-bc89-4271-759d-3a0f950b601a/artwork.jpg/100x100bb.jpg", "collectionPrice":0.99, "collectionExplicitness":"notExplicit", "trackCount":1, "copyright":"℗ 2020 spazzteam", "country":"USA", "currency":"USD", "releaseDate":"2020-01-10T08:00:00Z", "primaryGenreName":"Alternative"}, 
+{"wrapperType":"collection", "collectionType":"Album", "artistId":1536672362, "collectionId":1881945804, "artistName":"SenséD", "collectionName":"I Don’t Wanna Touch the Ground (Remix) - Single", "collectionCensoredName":"I Don’t Wanna Touch the Ground (Remix) - Single", "artistViewUrl":"https://music.apple.com/us/artist/sens%C3%A9d/1536672362?uo=4", "collectionViewUrl":"https://music.apple.com/us/album/i-dont-wanna-touch-the-ground-remix-single/1881945804?uo=4", "artworkUrl60":"https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/c8/2f/7d/c82f7ddf-d52f-6af0-e2bd-d0422c7cdbcc/8721466091952.png/60x60bb.jpg", "artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/c8/2f/7d/c82f7ddf-d52f-6af0-e2bd-d0422c7cdbcc/8721466091952.png/100x100bb.jpg", "collectionPrice":0.99, "collectionExplicitness":"notExplicit", "trackCount":1, "copyright":"℗ 2026 Bruno Marcolino Salles", "country":"USA", "currency":"USD", "releaseDate":"2026-03-20T07:00:00Z", "primaryGenreName":"Electronic"}]
+}
+
+

@@ -6,16 +6,24 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use discord_presence::Client;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use artwork::ArtworkClient;
 use player::{PlayerState, Track};
 
 const APPLE_MUSIC_CLIENT_ID: u64 = 773825528921849856;
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Poll rate while there is a track loaded, playing or paused.
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Poll rate while Music is closed or stopped. Each poll spawns an `osascript`
+/// process, and "Music is not open" is the state a login agent spends most of
+/// its life in, so it is not worth checking every second.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How far the computed start anchor may drift before we call it a seek rather
 /// than ordinary rounding between two polls.
 const SEEK_TOLERANCE_SECS: u64 = 2;
+/// How often an unchanged presence is pushed again. Discord allows 5 activity
+/// updates per 20 seconds, so this is far inside the budget.
+const REASSERT_INTERVAL_SECS: u64 = 30;
 
 /// What we last pushed to Discord, so we only speak to it when something
 /// actually changed. Discord rate-limits presence updates, and steady playback
@@ -24,9 +32,11 @@ struct Shown {
     track: Track,
     state: PlayerState,
     start: Option<u64>,
+    sent_at: u64,
 }
 
-fn needs_update(shown: Option<&Shown>, track: &Track, start: Option<u64>) -> bool {
+/// Whether Discord is showing something other than what is playing now.
+fn presence_changed(shown: Option<&Shown>, track: &Track, start: Option<u64>) -> bool {
     let Some(shown) = shown else {
         return true;
     };
@@ -42,6 +52,16 @@ fn needs_update(shown: Option<&Shown>, track: &Track, start: Option<u64>) -> boo
         (None, None) => false,
         _ => true,
     }
+}
+
+/// Whether the presence is due to be pushed again even though nothing changed.
+///
+/// `discord-presence` never tells us about a reconnect: `READY` is a global
+/// that is set once and the `Ready` event is suppressed on the second connect,
+/// so quitting and reopening Discord silently drops our activity. Without a
+/// timer the presence would stay blank until the next track change.
+fn reassert_due(shown: Option<&Shown>, now: u64) -> bool {
+    shown.is_none_or(|shown| now.saturating_sub(shown.sent_at) >= REASSERT_INTERVAL_SECS)
 }
 
 fn main() {
@@ -65,13 +85,21 @@ fn main() {
 
     let mut artwork = ArtworkClient::new();
     let mut shown: Option<Shown> = None;
+    let mut poll_interval = ACTIVE_POLL_INTERVAL;
 
     loop {
-        sleep(POLL_INTERVAL);
+        sleep(poll_interval);
 
-        // A failed poll is transient: keep whatever is on screen.
+        // A failed poll is transient: keep whatever is on screen, and keep the
+        // interval we were already using.
         let Some(track) = Track::from_apple_music() else {
             continue;
+        };
+
+        poll_interval = if track.player_state.has_track() {
+            ACTIVE_POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
         };
 
         if !track.player_state.has_track() {
@@ -87,22 +115,28 @@ fn main() {
             continue;
         }
 
+        let now = presence::unix_now();
         // Only a playing track gets a progress bar; a paused one sits still.
         let stamps = match track.player_state {
-            PlayerState::Playing => presence::timestamps(&track, presence::unix_now()),
+            PlayerState::Playing => presence::timestamps(&track, now),
             _ => None,
         };
         let start = stamps.map(|(start, _)| start);
 
-        if !needs_update(shown.as_ref(), &track, start) {
+        let changed = presence_changed(shown.as_ref(), &track, start);
+        if !changed && !reassert_due(shown.as_ref(), now) {
             continue;
         }
 
         let art = artwork.lookup(&track);
-        info!(
-            "{:?}: {} - {}",
-            track.player_state, track.artist, track.name
-        );
+        if changed {
+            info!(
+                "{:?}: {} - {}",
+                track.player_state, track.artist, track.name
+            );
+        } else {
+            debug!("re-asserting presence");
+        }
 
         if let Err(err) = drpc.set_activity(|activity| {
             presence::build_activity(activity, &track, art.as_ref(), stamps)
@@ -115,6 +149,7 @@ fn main() {
         shown = Some(Shown {
             state: track.player_state,
             start,
+            sent_at: now,
             track,
         });
     }
@@ -140,12 +175,13 @@ mod tests {
             track: track.clone(),
             state: track.player_state,
             start,
+            sent_at: 0,
         }
     }
 
     #[test]
     fn first_track_always_updates() {
-        assert!(needs_update(None, &playing(), Some(959)));
+        assert!(presence_changed(None, &playing(), Some(959)));
     }
 
     #[test]
@@ -153,9 +189,9 @@ mod tests {
         let track = playing();
         let shown = shown_from(&track, Some(959));
 
-        assert!(!needs_update(Some(&shown), &track, Some(959)));
+        assert!(!presence_changed(Some(&shown), &track, Some(959)));
         // One second of rounding slop must not trigger a new update.
-        assert!(!needs_update(Some(&shown), &track, Some(960)));
+        assert!(!presence_changed(Some(&shown), &track, Some(960)));
     }
 
     #[test]
@@ -163,7 +199,7 @@ mod tests {
         let track = playing();
         let shown = shown_from(&track, Some(959));
 
-        assert!(needs_update(Some(&shown), &track, Some(800)));
+        assert!(presence_changed(Some(&shown), &track, Some(800)));
     }
 
     #[test]
@@ -175,7 +211,7 @@ mod tests {
             player_state: PlayerState::Paused,
             ..track
         };
-        assert!(needs_update(Some(&shown), &paused, None));
+        assert!(presence_changed(Some(&shown), &paused, None));
     }
 
     #[test]
@@ -186,7 +222,37 @@ mod tests {
         };
         let shown = shown_from(&paused, None);
 
-        assert!(needs_update(Some(&shown), &playing(), Some(959)));
+        assert!(presence_changed(Some(&shown), &playing(), Some(959)));
+    }
+
+    #[test]
+    fn reassert_fires_on_a_timer() {
+        let track = playing();
+        let mut shown = shown_from(&track, Some(959));
+        shown.sent_at = 1_000;
+
+        assert!(!reassert_due(Some(&shown), 1_000));
+        assert!(!reassert_due(
+            Some(&shown),
+            1_000 + REASSERT_INTERVAL_SECS - 1
+        ));
+        assert!(reassert_due(Some(&shown), 1_000 + REASSERT_INTERVAL_SECS));
+    }
+
+    #[test]
+    fn reassert_is_due_when_nothing_is_shown() {
+        assert!(reassert_due(None, 0));
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_wedge_the_reassert() {
+        let track = playing();
+        let mut shown = shown_from(&track, Some(959));
+        shown.sent_at = 5_000;
+
+        // Waking from sleep can hand us a `now` behind `sent_at`; that must not
+        // underflow into a permanently-due or permanently-quiet state.
+        assert!(!reassert_due(Some(&shown), 1_000));
     }
 
     #[test]
@@ -198,7 +264,7 @@ mod tests {
             name: "Cecilia".into(),
             ..track
         };
-        assert!(needs_update(Some(&shown), &next, Some(959)));
+        assert!(presence_changed(Some(&shown), &next, Some(959)));
     }
 
     #[test]
@@ -212,6 +278,6 @@ mod tests {
             position: 0.0,
             ..track
         };
-        assert!(needs_update(Some(&shown), &restarted, Some(1_000)));
+        assert!(presence_changed(Some(&shown), &restarted, Some(1_000)));
     }
 }
