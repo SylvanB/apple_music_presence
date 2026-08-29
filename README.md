@@ -48,6 +48,14 @@ rm ~/Library/LaunchAgents/com.goldsoultheory.apple-music-presence.plist
   pausing and restarting the daemon.
 - Discord is only sent an update when something really changed; steady playback
   produces no traffic beyond a re-assert every 30 seconds.
+- Updates are only sent while the Discord socket is up. Sending into a dead one
+  deadlocks permanently: the connection manager pops a queued message off the
+  channel before attempting the write, drops it if the write fails, and the
+  response we block on is therefore never produced — on a channel that cannot
+  error, because the manager holds both of its ends. Updates are held and
+  flushed on reconnect instead. If one ever does hang for over a minute, the
+  process exits so the launchd agent restarts it, because nothing in-process
+  can break that deadlock.
 - A Discord restart is recovered from immediately. Reconnecting drops whatever
   activity was set and `Ready` does not fire twice (`READY` is a global set
   once), so the `Connected` event drives the re-push; the 30 second timer is

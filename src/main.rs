@@ -2,7 +2,7 @@ mod artwork;
 mod player;
 mod presence;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, sleep};
 use std::time::Duration;
@@ -27,6 +27,12 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How far the computed start anchor may drift before we call it a seek rather
 /// than ordinary rounding between two polls.
 const SEEK_TOLERANCE_SECS: u64 = 2;
+/// How often the Discord thread re-checks whether it may send.
+const SEND_RECHECK: Duration = Duration::from_millis(500);
+/// How long a single Discord update may be outstanding before we treat the
+/// connection as unrecoverable. Nothing in-process can break the deadlock —
+/// see `run_discord` — so the only way out is to restart.
+const SEND_WEDGE_SECS: u64 = 60;
 /// How many consecutive poll failures are logged in full before we go quiet.
 const FAILURE_LOG_LIMIT: u32 = 3;
 /// Once quiet, how many further failures pass between reminders. Revoking the
@@ -72,18 +78,18 @@ impl Mailbox {
         self.arrived.notify_one();
     }
 
-    /// Blocks until there is something to send.
-    fn take(&self) -> Desired {
+    /// Waits up to `timeout` for something to send.
+    fn take_timeout(&self, timeout: Duration) -> Option<Desired> {
         let mut slot = self.lock();
-        loop {
-            if let Some(desired) = slot.take() {
-                return desired;
-            }
-            slot = self
-                .arrived
-                .wait(slot)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(desired) = slot.take() {
+            return Some(desired);
         }
+
+        let (mut slot, _) = self
+            .arrived
+            .wait_timeout(slot, timeout)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.take()
     }
 
     /// A panicking peer leaves the slot intact, and a stale presence beats
@@ -96,26 +102,52 @@ impl Mailbox {
 }
 
 /// Owns everything that can block: the Discord client and the artwork lookups.
-fn run_discord(mut drpc: Client, mailbox: &Mailbox) {
+///
+/// Sending while the socket is down is what deadlocks this thread, and it is
+/// not recoverable. The connection manager pops a queued message off the
+/// channel *before* attempting the write; if the write fails the message is
+/// simply dropped, so the response we are waiting on is never produced. That
+/// `recv` can never even error, because the manager holds both ends of the
+/// channel. Hence the `connected` gate: hold the update instead of sending it,
+/// and flush once Discord is back.
+fn run_discord(
+    mut drpc: Client,
+    mailbox: &Mailbox,
+    connected: &AtomicBool,
+    send_started: &AtomicU64,
+) {
     let mut artwork = ArtworkClient::new();
+    let mut pending: Option<Desired> = None;
 
     loop {
-        match mailbox.take() {
-            Desired::Clear => {
-                if let Err(err) = drpc.clear_activity() {
-                    warn!("failed to clear presence: {err}");
-                }
-            }
+        if let Some(desired) = mailbox.take_timeout(SEND_RECHECK) {
+            pending = Some(desired);
+        }
+
+        if !connected.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Some(desired) = pending.take() else {
+            continue;
+        };
+
+        // Watched by the poll loop, which restarts us if this never clears.
+        send_started.store(presence::unix_now(), Ordering::Relaxed);
+        let result = match desired {
+            Desired::Clear => drpc.clear_activity(),
             Desired::Show { track, stamps } => {
                 let art = artwork.lookup(&track);
-                if let Err(err) = drpc.set_activity(|activity| {
+                drpc.set_activity(|activity| {
                     presence::build_activity(activity, &track, art.as_ref(), stamps)
-                }) {
-                    // The poll loop re-asserts on a timer, so a failed send is
-                    // retried without needing to be tracked here.
-                    warn!("failed to set presence: {err}");
-                }
+                })
             }
+        };
+        send_started.store(0, Ordering::Relaxed);
+
+        if let Err(err) = result {
+            // The poll loop re-asserts on a timer, so a failed send is retried
+            // without needing to be tracked here.
+            warn!("failed to update presence: {err}");
         }
     }
 }
@@ -169,6 +201,11 @@ fn main() {
     // Set on every connect, including reconnects, and consumed by the loop to
     // re-push the activity that Discord dropped while we were disconnected.
     let reconnected = Arc::new(AtomicBool::new(false));
+    // Gates the Discord thread: sending into a dead socket deadlocks it.
+    let connected = Arc::new(AtomicBool::new(false));
+    // Non-zero while a Discord update is outstanding, so the poll loop can tell
+    // when one has hung.
+    let send_started = Arc::new(AtomicU64::new(0));
 
     drpc.on_ready(|_ctx| info!("connected to Discord"))
         .persist();
@@ -176,11 +213,21 @@ fn main() {
         .persist();
     drpc.on_connected({
         let reconnected = Arc::clone(&reconnected);
-        move |_ctx| reconnected.store(true, Ordering::Relaxed)
+        let connected = Arc::clone(&connected);
+        move |_ctx| {
+            connected.store(true, Ordering::Relaxed);
+            reconnected.store(true, Ordering::Relaxed);
+        }
     })
     .persist();
-    drpc.on_disconnected(|_ctx| warn!("disconnected from Discord"))
-        .persist();
+    drpc.on_disconnected({
+        let connected = Arc::clone(&connected);
+        move |_ctx| {
+            connected.store(false, Ordering::Relaxed);
+            warn!("disconnected from Discord");
+        }
+    })
+    .persist();
 
     drpc.start();
 
@@ -192,7 +239,9 @@ fn main() {
     let mailbox = Arc::new(Mailbox::default());
     thread::spawn({
         let mailbox = Arc::clone(&mailbox);
-        move || run_discord(drpc, &mailbox)
+        let connected = Arc::clone(&connected);
+        let send_started = Arc::clone(&send_started);
+        move || run_discord(drpc, &mailbox, &connected, &send_started)
     });
 
     let mut shown: Option<Shown> = None;
@@ -246,6 +295,15 @@ fn main() {
         }
 
         let now = presence::unix_now();
+
+        // A hung update cannot be broken from inside this process, so the only
+        // honest recovery is to die and let launchd start us again.
+        let started = send_started.load(Ordering::Relaxed);
+        if started != 0 && now.saturating_sub(started) > SEND_WEDGE_SECS {
+            error!("a Discord update has been stuck for over {SEND_WEDGE_SECS}s; exiting so the service restarts");
+            std::process::exit(1);
+        }
+
         // Only a playing track gets a progress bar; a paused one sits still.
         let stamps = match track.player_state {
             PlayerState::Playing => presence::timestamps(&track, now),
@@ -331,7 +389,10 @@ mod tests {
         }
 
         // A blocked Discord thread must not replay a backlog of stale tracks.
-        assert_eq!(shown_track(&mailbox.take()), "third");
+        assert_eq!(
+            shown_track(&mailbox.take_timeout(Duration::from_secs(2)).unwrap()),
+            "third"
+        );
     }
 
     #[test]
@@ -343,7 +404,16 @@ mod tests {
             mailbox.put(Desired::Clear);
         }
 
-        assert!(matches!(mailbox.take(), Desired::Clear));
+        assert!(matches!(
+            mailbox.take_timeout(Duration::from_secs(2)).unwrap(),
+            Desired::Clear
+        ));
+    }
+
+    #[test]
+    fn mailbox_take_times_out_when_nothing_arrives() {
+        let mailbox = Mailbox::default();
+        assert!(mailbox.take_timeout(Duration::from_millis(20)).is_none());
     }
 
     #[test]
@@ -359,7 +429,10 @@ mod tests {
             });
         });
 
-        assert_eq!(shown_track(&mailbox.take()), "The Boxer");
+        assert_eq!(
+            shown_track(&mailbox.take_timeout(Duration::from_secs(2)).unwrap()),
+            "The Boxer"
+        );
         handle.join().unwrap();
     }
 
@@ -375,7 +448,10 @@ mod tests {
 
         // Stopping playback while the writer is stuck must not resurrect the
         // track once it unblocks.
-        assert!(matches!(mailbox.take(), Desired::Clear));
+        assert!(matches!(
+            mailbox.take_timeout(Duration::from_secs(2)).unwrap(),
+            Desired::Clear
+        ));
     }
 
     #[test]
