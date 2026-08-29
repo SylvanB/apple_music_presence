@@ -92,3 +92,18 @@ always something to click.
 ## References
 
 https://github.com/NextFire/apple-music-discord-rpc/blob/main/music-rpc.ts
+
+## Badge artwork
+
+`contrib/assets/` holds the two `small_image` badges as SVG source and rendered
+512×512 PNG. Upload the PNGs in the developer portal under Rich Presence → Art
+Assets, named exactly `paused` and `favorited`.
+
+Discord crops `small_image` to a circle and renders it small, in the corner of
+the album art, so both are a full-bleed disc with a single high-contrast glyph
+and a faint inner rim — the rim is what keeps the dark pause badge from
+disappearing into dark album covers. Re-render after editing the SVG with:
+
+```bash
+rsvg-convert -w 512 -h 512 contrib/assets/paused.svg -o contrib/assets/paused.png
+```

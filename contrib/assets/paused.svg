@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Full-bleed disc: Discord crops small_image to a circle, so the artwork
+       fills the square and the crop lands exactly on the edge. -->
+  <circle cx="256" cy="256" r="256" fill="#2C2C2E"/>
+  <!-- Inset rim, so a dark badge still separates from dark album art. -->
+  <circle cx="256" cy="256" r="244" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="10"/>
+  <g fill="#FFFFFF">
+    <rect x="176" y="160" width="54" height="192" rx="20"/>
+    <rect x="282" y="160" width="54" height="192" rx="20"/>
+  </g>
+</svg>
