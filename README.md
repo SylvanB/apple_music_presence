@@ -68,10 +68,11 @@ card if any is missing:
 expects; the album goes to `large_text`, which a Listening card renders as a
 third line.
 
-The `paused` and `favorited` badges are `small_image` asset keys. They resolve
-only on a Discord application you own and have uploaded art to under those
-names — against someone else's application ID they are simply ignored, so
-setting them costs nothing in the meantime.
+The `paused` and `favorited` badges are `small_image` asset keys, resolved
+against the Discord application named by `APPLE_MUSIC_CLIENT_ID`. Upload art
+under exactly those names in the developer portal, under Rich Presence → Art
+Assets; they take a few minutes to propagate, and Discord caches application
+metadata, so quit and reopen it if a badge does not show up.
 
 ## Album art
 

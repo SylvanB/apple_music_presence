@@ -13,7 +13,11 @@ use tracing::{debug, error, info, warn};
 use artwork::ArtworkClient;
 use player::{PlayerState, Track};
 
-const APPLE_MUSIC_CLIENT_ID: u64 = 773825528921849856;
+/// The Discord application this presence is published as. Its *name* is what
+/// renders after "Listening to", and owning it is what lets the `paused` and
+/// `favorited` art assets in `presence` resolve. Public by design — the RPC
+/// handshake needs only the id, never the client secret.
+const APPLE_MUSIC_CLIENT_ID: u64 = 1_543_168_751_921_401_947;
 /// Poll rate while there is a track loaded, playing or paused.
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Poll rate while Music is closed or stopped. Each poll spawns an `osascript`
