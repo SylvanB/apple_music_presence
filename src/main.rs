@@ -23,6 +23,12 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How far the computed start anchor may drift before we call it a seek rather
 /// than ordinary rounding between two polls.
 const SEEK_TOLERANCE_SECS: u64 = 2;
+/// How many consecutive poll failures are logged in full before we go quiet.
+const FAILURE_LOG_LIMIT: u32 = 3;
+/// Once quiet, how many further failures pass between reminders. Revoking the
+/// Automation permission fails every poll forever, and a login agent writing a
+/// line per poll would grow its log file without bound.
+const FAILURE_LOG_EVERY: u32 = 60;
 /// How often an unchanged presence is pushed again, as a backstop to the
 /// `Connected` event below. Discord allows 5 activity updates per 20 seconds,
 /// so this is far inside the budget.
@@ -100,14 +106,37 @@ fn main() {
     let mut artwork = ArtworkClient::new();
     let mut shown: Option<Shown> = None;
     let mut poll_interval = ACTIVE_POLL_INTERVAL;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         sleep(poll_interval);
 
-        // A failed poll is transient: keep whatever is on screen, and keep the
-        // interval we were already using.
-        let Some(track) = Track::from_apple_music() else {
-            continue;
+        // A failed poll leaves whatever is on screen alone: it is usually
+        // transient, and when it is not, tearing the presence down would not
+        // help anyway.
+        let track = match Track::from_apple_music() {
+            Ok(track) => {
+                if consecutive_failures > FAILURE_LOG_LIMIT {
+                    info!("reading Music.app recovered after {consecutive_failures} failures");
+                }
+                consecutive_failures = 0;
+                track
+            }
+            Err(err) => {
+                consecutive_failures += 1;
+                if consecutive_failures <= FAILURE_LOG_LIMIT {
+                    warn!("could not read Music.app: {err}");
+                    if consecutive_failures == FAILURE_LOG_LIMIT {
+                        warn!("further failures will be logged every {FAILURE_LOG_EVERY} polls");
+                    }
+                } else if consecutive_failures.is_multiple_of(FAILURE_LOG_EVERY) {
+                    warn!("still cannot read Music.app after {consecutive_failures} polls: {err}");
+                }
+
+                // Whatever is broken is unlikely to fix itself within a second.
+                poll_interval = IDLE_POLL_INTERVAL;
+                continue;
+            }
         };
 
         poll_interval = if track.player_state.has_track() {
@@ -184,6 +213,7 @@ mod tests {
             duration: 312.0,
             position: 41.0,
             player_state: PlayerState::Playing,
+            favorited: false,
         }
     }
 

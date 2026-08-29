@@ -3,7 +3,7 @@
 use std::process::Command;
 
 use serde::{Deserialize, Deserializer};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// The JXA snippet handed to `osascript`.
 ///
@@ -24,6 +24,16 @@ const PLAYER_STATE_SCRIPT: &str = r#"
         output.albumName = track.album();
         output.duration = track.duration() || 0;
         output.position = Music.playerPosition() || 0;
+        // "loved" was renamed "favorited"; older systems only have the former.
+        try {
+          output.favorited = track.favorited();
+        } catch (e) {
+          try {
+            output.favorited = track.loved();
+          } catch (e2) {
+            output.favorited = false;
+          }
+        }
       }
     }
     JSON.stringify(output)
@@ -83,6 +93,8 @@ pub struct Track {
     pub position: f64,
     #[serde(default, rename = "playerState")]
     pub player_state: PlayerState,
+    #[serde(default)]
+    pub favorited: bool,
 }
 
 impl Track {
@@ -93,28 +105,28 @@ impl Track {
         self.name == other.name && self.artist == other.artist && self.album == other.album
     }
 
-    /// Polls Music.app. Returns `None` on any transient failure so the caller
-    /// can keep the existing presence rather than tearing it down.
-    pub fn from_apple_music() -> Option<Self> {
+    /// Polls Music.app.
+    ///
+    /// The error is returned rather than logged: a revoked Automation
+    /// permission fails on every single poll, and only the caller knows how
+    /// often it has already complained.
+    pub fn from_apple_music() -> Result<Self, String> {
         let output = Command::new("osascript")
             .args(["-l", "JavaScript", "-e", PLAYER_STATE_SCRIPT])
             .output()
-            .map_err(|err| warn!("could not run osascript: {err}"))
-            .ok()?;
+            .map_err(|err| format!("could not run osascript: {err}"))?;
 
         if !output.status.success() {
-            warn!(
+            return Err(format!(
                 "osascript exited with {}: {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
-            );
-            return None;
+            ));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         serde_json::from_str(stdout.trim())
-            .map_err(|err| warn!("could not parse player state {:?}: {err}", stdout.trim()))
-            .ok()
+            .map_err(|err| format!("could not parse player state {:?}: {err}", stdout.trim()))
     }
 }
 
@@ -135,6 +147,28 @@ mod tests {
         assert_eq!(track.artist, "Simon & Garfunkel");
         assert_eq!(track.player_state, PlayerState::Playing);
         assert_eq!(track.position, 41.25);
+    }
+
+    #[test]
+    fn parses_the_favourite_flag() {
+        let loved: Track = serde_json::from_str(
+            r#"{"trackName":"The Boxer","playerState":"playing","favorited":true}"#,
+        )
+        .unwrap();
+        assert!(loved.favorited);
+
+        // Systems too old for either property simply omit it.
+        let unknown: Track =
+            serde_json::from_str(r#"{"trackName":"The Boxer","playerState":"playing"}"#).unwrap();
+        assert!(!unknown.favorited);
+    }
+
+    #[test]
+    fn a_failed_poll_reports_why() {
+        // The caller rate-limits the logging, so the message must come back out
+        // rather than being swallowed here.
+        let err = serde_json::from_str::<Track>("not json").unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]

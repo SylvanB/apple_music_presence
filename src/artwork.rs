@@ -92,6 +92,20 @@ fn pick_best<'a>(results: &'a [SearchResult], album: &str) -> Option<&'a SearchR
         .or_else(|| results.first())
 }
 
+/// A "search Apple Music for this" link, for tracks iTunes could not match.
+/// Always available, so the presence never ends up without a button.
+pub fn search_url(track: &Track) -> Option<String> {
+    let term = format!("{} {}", track.artist, track.name);
+    let term = term.trim();
+    if term.is_empty() {
+        return None;
+    }
+
+    reqwest::Url::parse_with_params("https://music.apple.com/search", &[("term", term)])
+        .ok()
+        .map(String::from)
+}
+
 pub struct ArtworkClient {
     http: reqwest::blocking::Client,
     /// Negative results are cached too, so an unfindable track costs one

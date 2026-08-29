@@ -39,7 +39,11 @@ rm ~/Library/LaunchAgents/com.goldsoultheory.apple-music-presence.plist
 - **Never launches Music.app.** The player is only queried once `running()`
   reports true, because touching any other property would start the app.
 - Presence is cleared when playback stops or Music quits.
-- Paused tracks stay on screen without a progress bar.
+- Paused tracks stay on screen without a progress bar, and carry a `paused`
+  badge; a favourited track playing carries a `favorited` one.
+- Repeated failures to read Music.app — a revoked Automation permission fails
+  every single poll — are logged three times, then only once every 60 polls, so
+  an agent left running cannot grow its log file without bound.
 - The progress bar is anchored to the actual playhead, so it survives seeking,
   pausing and restarting the daemon.
 - Discord is only sent an update when something really changed; steady playback
@@ -61,7 +65,13 @@ card if any is missing:
 | `status_display_type` | `2` (Details) | member list shows the track, not the app |
 
 `details` carries the track and `state` the artist, which is the order Discord
-expects; the album goes to `large_text` as the artwork tooltip.
+expects; the album goes to `large_text`, which a Listening card renders as a
+third line.
+
+The `paused` and `favorited` badges are `small_image` asset keys. They resolve
+only on a Discord application you own and have uploaded art to under those
+names — against someone else's application ID they are simply ignored, so
+setting them costs nothing in the meantime.
 
 ## Album art
 
@@ -72,7 +82,9 @@ A song search is tried first; if it comes back empty, which happens for local
 files, non-English titles and remixes, an album search stands in. iTunes labels
 short releases "Album - Single", so album titles are normalised before matching.
 Results are cached per track (including misses), and a failed lookup degrades to
-a presence without art rather than taking the process down.
+a presence without art rather than taking the process down. When iTunes has no
+match at all, the button falls back to an Apple Music search link, so there is
+always something to click.
 
 [itunes]: https://performance-partners.apple.com/search-api
 

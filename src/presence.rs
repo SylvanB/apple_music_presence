@@ -4,13 +4,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use discord_presence::models::{Activity, ActivityType, DisplayType};
 
-use crate::artwork::Artwork;
-use crate::player::Track;
+use crate::artwork::{self, Artwork};
+use crate::player::{PlayerState, Track};
 
 /// Discord rejects `state`/`details` outside 2..=128 characters.
 const MIN_FIELD_CHARS: usize = 2;
 const MAX_FIELD_CHARS: usize = 128;
 const BUTTON_LABEL: &str = "Listen on Apple Music";
+/// Asset keys on the Discord application behind `APPLE_MUSIC_CLIENT_ID`. They
+/// only resolve once that application is one you own and have uploaded art to
+/// under these names; until then Discord just renders no badge, which is why
+/// setting them is harmless in the meantime.
+const PAUSED_ASSET: &str = "paused";
+const FAVORITED_ASSET: &str = "favorited";
 
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -74,13 +80,23 @@ pub fn build_activity(
 
     let large_image = artwork.map(|art| art.image_url.clone());
     let large_text = field(&track.album);
-    if large_image.is_some() || large_text.is_some() {
+    // Pause is the more urgent of the two states, so it wins the badge: a
+    // stalled card that still looks live is worse than a hidden heart.
+    let badge = match track.player_state {
+        PlayerState::Paused => Some((PAUSED_ASSET, "Paused")),
+        _ if track.favorited => Some((FAVORITED_ASSET, "Favorited")),
+        _ => None,
+    };
+    if large_image.is_some() || large_text.is_some() || badge.is_some() {
         activity = activity.assets(|mut assets| {
             if let Some(image) = large_image {
                 assets = assets.large_image(image);
             }
             if let Some(text) = large_text {
                 assets = assets.large_text(text);
+            }
+            if let Some((image, text)) = badge {
+                assets = assets.small_image(image).small_text(text);
             }
             assets
         });
@@ -90,7 +106,11 @@ pub fn build_activity(
         activity = activity.timestamps(|stamps| stamps.start(start).end(end));
     }
 
-    if let Some(url) = artwork.and_then(|art| art.track_url.clone()) {
+    // Fall back to a search link so there is always something to click.
+    let button_url = artwork
+        .and_then(|art| art.track_url.clone())
+        .or_else(|| artwork::search_url(track));
+    if let Some(url) = button_url {
         activity = activity.append_buttons(|button| button.label(BUTTON_LABEL).url(url));
     }
 
@@ -100,7 +120,6 @@ pub fn build_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::PlayerState;
 
     fn boxer() -> Track {
         Track {
@@ -110,6 +129,7 @@ mod tests {
             duration: 312.0,
             position: 41.0,
             player_state: PlayerState::Playing,
+            favorited: false,
         }
     }
 
@@ -193,14 +213,63 @@ mod tests {
     }
 
     #[test]
-    fn no_button_without_a_link() {
+    fn falls_back_to_a_search_link_when_itunes_had_no_url() {
         let art = Artwork {
             track_url: None,
             ..artwork()
         };
         let activity = build_activity(Activity::new(), &boxer(), Some(&art), None);
 
+        assert_eq!(activity.buttons.len(), 1);
+        let url = activity.buttons[0].url.as_deref().expect("url");
+        assert!(url.starts_with("https://music.apple.com/search?term="));
+        // The ampersand in "Simon & Garfunkel" must not split the query.
+        assert!(url.contains("Simon+%26+Garfunkel"));
+    }
+
+    #[test]
+    fn a_track_with_no_metadata_gets_no_button() {
+        let activity = build_activity(Activity::new(), &Track::default(), None, None);
+
         assert!(activity.buttons.is_empty());
+    }
+
+    #[test]
+    fn paused_tracks_get_the_pause_badge() {
+        let paused = Track {
+            player_state: PlayerState::Paused,
+            favorited: true,
+            ..boxer()
+        };
+        let assets = build_activity(Activity::new(), &paused, None, None)
+            .assets
+            .expect("assets");
+
+        // Pause outranks the heart.
+        assert_eq!(assets.small_image.as_deref(), Some(PAUSED_ASSET));
+        assert_eq!(assets.small_text.as_deref(), Some("Paused"));
+    }
+
+    #[test]
+    fn favorited_tracks_get_the_heart_while_playing() {
+        let loved = Track {
+            favorited: true,
+            ..boxer()
+        };
+        let assets = build_activity(Activity::new(), &loved, None, None)
+            .assets
+            .expect("assets");
+
+        assert_eq!(assets.small_image.as_deref(), Some(FAVORITED_ASSET));
+    }
+
+    #[test]
+    fn an_ordinary_playing_track_gets_no_badge() {
+        let assets = build_activity(Activity::new(), &boxer(), None, None)
+            .assets
+            .expect("assets");
+
+        assert!(assets.small_image.is_none());
     }
 
     #[test]
