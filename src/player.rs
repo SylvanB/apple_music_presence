@@ -13,26 +13,34 @@ use tracing::debug;
 const PLAYER_STATE_SCRIPT: &str = r#"
     const Music = Application("Music");
     const output = {};
+
+    // Every property is read through this. A radio stream or a URL track does
+    // not carry the same properties as a library track, and one throwing would
+    // otherwise fail the whole script and blind us to the player entirely.
+    const read = (get, fallback) => {
+      try {
+        const value = get();
+        return (value === null || value === undefined) ? fallback : value;
+      } catch (e) {
+        return fallback;
+      }
+    };
+
     if (!Music.running()) {
       output.playerState = "not running";
     } else {
-      output.playerState = Music.playerState();
+      output.playerState = read(() => Music.playerState(), "stopped");
       if (output.playerState === "playing" || output.playerState === "paused") {
         const track = Music.currentTrack;
-        output.trackName = track.name();
-        output.artistName = track.artist();
-        output.albumName = track.album();
-        output.duration = track.duration() || 0;
-        output.position = Music.playerPosition() || 0;
+        output.trackName = read(() => track.name(), "");
+        output.artistName = read(() => track.artist(), "");
+        output.albumName = read(() => track.album(), "");
+        output.duration = read(() => track.duration(), 0);
+        output.position = read(() => Music.playerPosition(), 0);
         // "loved" was renamed "favorited"; older systems only have the former.
-        try {
-          output.favorited = track.favorited();
-        } catch (e) {
-          try {
-            output.favorited = track.loved();
-          } catch (e2) {
-            output.favorited = false;
-          }
+        output.favorited = read(() => track.favorited(), null);
+        if (output.favorited === null) {
+          output.favorited = read(() => track.loved(), false);
         }
       }
     }
