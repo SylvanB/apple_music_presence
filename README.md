@@ -5,6 +5,12 @@ protocol. Presents as a **Listening** activity, so Discord renders it as a music
 card — album art, a seek bar, and a link back to the track — rather than as a
 game with a countdown.
 
+## Requirements
+
+- macOS with the Music app
+- Discord desktop app
+- Rust stable toolchain
+
 ## Usage
 
 ```bash
@@ -124,3 +130,7 @@ disappearing into dark album covers. Re-render after editing the SVG with:
 ```bash
 rsvg-convert -w 512 -h 512 contrib/assets/paused.svg -o contrib/assets/paused.png
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

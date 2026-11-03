@@ -2,8 +2,11 @@
 name = "apple_music_presence"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "A macOS daemon that reports Apple Music playback to Discord Rich Presence"
+license = "MIT"
+repository = "https://github.com/SylvanB/apple_music_presence"
+keywords = ["apple-music", "discord", "rich-presence", "macos"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 discord-presence = "3.2.0"
